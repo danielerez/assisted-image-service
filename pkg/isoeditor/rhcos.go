@@ -12,6 +12,7 @@ import (
 
 const (
 	RamDiskPaddingLength = uint64(1024 * 1024) // 1MB
+	NmstatectlPath       = "/usr/bin/nmstatectl"
 	ramDiskImagePath     = "/images/assisted_installer_custom.img"
 	nmstateDiskImagePath = "/images/nmstate.img"
 )
@@ -22,31 +23,14 @@ type Editor interface {
 }
 
 type rhcosEditor struct {
-	workDir string
+	workDir, nmstatectlPath string
 }
 
-func NewEditor(dataDir string) Editor {
-	return &rhcosEditor{workDir: dataDir}
-}
-
-func createNmstateRamDisk() ([]byte, error) {
-	srcPath := "/usr/bin/nmstatectl"
-
-	// Check if the file exists
-	if _, err := os.Stat(srcPath); os.IsNotExist(err) {
-		return nil, err
+func NewEditor(dataDir, nmstatectlPath string) Editor {
+	return &rhcosEditor{
+		workDir:        dataDir,
+		nmstatectlPath: nmstatectlPath,
 	}
-
-	nmstateBinContent, err := os.ReadFile(srcPath)
-	if err != nil {
-		return nil, err
-	}
-
-	compressedCpio, err := generateCompressedCPIO(nmstateBinContent, srcPath, 0o100_755)
-	if err != nil {
-		return nil, err
-	}
-	return compressedCpio, nil
 }
 
 // CreateMinimalISO Creates the minimal iso by removing the rootfs and adding the url
@@ -55,37 +39,24 @@ func CreateMinimalISO(extractDir, volumeID, rootFSURL, arch, minimalISOPath stri
 		return err
 	}
 
-	runtimeArch := normalizeCPUArchitecture(runtime.GOARCH)
-	if runtimeArch == arch {
-		// create a compressed nmstatectl binary RAM disk image
-		compressedBuffer, err := createNmstateRamDisk()
-		if err != nil {
-			return err
-		}
-
-		f, err := os.Create(filepath.Join(extractDir, nmstateDiskImagePath))
-		if err != nil {
-			return err
-		}
-
-		_, err = f.Write(compressedBuffer)
-		if err != nil {
-			return err
-		}
-	}
 	if err := embedInitrdPlaceholders(extractDir); err != nil {
 		log.WithError(err).Warnf("Failed to embed initrd placeholders")
 		return err
 	}
 
-	if err := fixGrubConfig(rootFSURL, extractDir); err != nil {
+	var includeNmstateRamDisk bool
+	if _, err := os.Stat(filepath.Join(extractDir, nmstateDiskImagePath)); err == nil {
+		includeNmstateRamDisk = true
+	}
+
+	if err := fixGrubConfig(rootFSURL, extractDir, includeNmstateRamDisk); err != nil {
 		log.WithError(err).Warnf("Failed to edit grub config")
 		return err
 	}
 
 	// ignore isolinux.cfg for ppc64le because it doesn't exist
 	if arch != "ppc64le" {
-		if err := fixIsolinuxConfig(rootFSURL, extractDir); err != nil {
+		if err := fixIsolinuxConfig(rootFSURL, extractDir, includeNmstateRamDisk); err != nil {
 			log.WithError(err).Warnf("Failed to edit isolinux config")
 			return err
 		}
@@ -113,7 +84,44 @@ func (e *rhcosEditor) CreateMinimalISOTemplate(fullISOPath, rootFSURL, arch, min
 		return err
 	}
 
+	err = createNmstateRamDisk(extractDir, arch, e.nmstatectlPath, nmstateDiskImagePath)
+	if err != nil {
+		return fmt.Errorf("failed to create nmstate ram disk for arch %s: %v", arch, err)
+	}
+
 	err = CreateMinimalISO(extractDir, volumeID, rootFSURL, arch, minimalISOPath)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func createNmstateRamDisk(extractDir, arch, nmstatectlPath, ramDiskPath string) error {
+	// Ensure that the runtime CPU arch equals to the requested arch
+	if normalizeCPUArchitecture(runtime.GOARCH) != arch {
+		return nil
+	}
+
+	// Check if nmstatectl binary file exists
+	if _, err := os.Stat(nmstatectlPath); os.IsNotExist(err) {
+		return err
+	}
+
+	// Read binary
+	nmstateBinContent, err := os.ReadFile(nmstatectlPath)
+	if err != nil {
+		return err
+	}
+
+	// Create a compressed RAM disk image with the nmstatectl binary
+	compressedCpio, err := generateCompressedCPIO(nmstateBinContent, nmstatectlPath, 0o100_755)
+	if err != nil {
+		return err
+	}
+
+	// Write RAM disk file
+	err = os.WriteFile(filepath.Join(extractDir, ramDiskPath), compressedCpio, 0755)
 	if err != nil {
 		return err
 	}
@@ -143,7 +151,7 @@ func embedInitrdPlaceholders(extractDir string) error {
 	return nil
 }
 
-func fixGrubConfig(rootFSURL, extractDir string) error {
+func fixGrubConfig(rootFSURL, extractDir string, includeNmstateRamDisk bool) error {
 	availableGrubPaths := []string{"EFI/redhat/grub.cfg", "EFI/fedora/grub.cfg", "boot/grub/grub.cfg", "EFI/centos/grub.cfg"}
 	var foundGrubPath string
 	for _, pathSection := range availableGrubPaths {
@@ -169,14 +177,20 @@ func fixGrubConfig(rootFSURL, extractDir string) error {
 	}
 
 	// Edit config to add custom ramdisk image to initrd
-	if err := editFile(foundGrubPath, `(?m)^(\s+initrd) (.+| )+$`, fmt.Sprintf("$1 $2 %s %s", ramDiskImagePath, nmstateDiskImagePath)); err != nil {
-		return err
+	if includeNmstateRamDisk {
+		if err := editFile(foundGrubPath, `(?m)^(\s+initrd) (.+| )+$`, fmt.Sprintf("$1 $2 %s %s", ramDiskImagePath, nmstateDiskImagePath)); err != nil {
+			return err
+		}
+	} else {
+		if err := editFile(foundGrubPath, `(?m)^(\s+initrd) (.+| )+$`, fmt.Sprintf("$1 $2 %s", ramDiskImagePath)); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-func fixIsolinuxConfig(rootFSURL, extractDir string) error {
+func fixIsolinuxConfig(rootFSURL, extractDir string, includeNmstateRamDisk bool) error {
 	replacement := fmt.Sprintf("$1 $2 coreos.live.rootfs_url=%s", rootFSURL)
 	if err := editFile(filepath.Join(extractDir, "isolinux/isolinux.cfg"), `(?m)^(\s+append) (.+| )+$`, replacement); err != nil {
 		return err
@@ -186,8 +200,14 @@ func fixIsolinuxConfig(rootFSURL, extractDir string) error {
 		return err
 	}
 
-	if err := editFile(filepath.Join(extractDir, "isolinux/isolinux.cfg"), `(?m)^(\s+append.*initrd=\S+) (.*)$`, fmt.Sprintf("${1},%s,%s ${2}", ramDiskImagePath, nmstateDiskImagePath)); err != nil {
-		return err
+	if includeNmstateRamDisk {
+		if err := editFile(filepath.Join(extractDir, "isolinux/isolinux.cfg"), `(?m)^(\s+append.*initrd=\S+) (.*)$`, fmt.Sprintf("${1},%s,%s ${2}", ramDiskImagePath, nmstateDiskImagePath)); err != nil {
+			return err
+		}
+	} else {
+		if err := editFile(filepath.Join(extractDir, "isolinux/isolinux.cfg"), `(?m)^(\s+append.*initrd=\S+) (.*)$`, fmt.Sprintf("${1},%s ${2}", ramDiskImagePath)); err != nil {
+			return err
+		}
 	}
 
 	return nil
