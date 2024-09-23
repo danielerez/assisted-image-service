@@ -1,12 +1,16 @@
 package isoeditor
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strings"
 
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -68,6 +72,128 @@ func CreateMinimalISO(extractDir, volumeID, rootFSURL, arch, minimalISOPath stri
 	return nil
 }
 
+func execute(command, workDir string) (string, error) {
+	var stdoutBytes, stderrBytes bytes.Buffer
+	formattedCmd, args := formatCommand(command)
+	cmd := exec.Command(formattedCmd, args...)
+	cmd.Stdout = &stdoutBytes
+	cmd.Stderr = &stderrBytes
+
+	fmt.Printf("Running cmd: %s %s\n", formattedCmd, strings.Join(args[:], " "))
+	cmd.Dir = workDir
+	err := cmd.Run()
+	if err != nil {
+		return "", errors.Wrapf(err, "Failed to execute cmd (%s): %s", cmd, stderrBytes.String())
+	}
+
+	return strings.TrimSuffix(stdoutBytes.String(), "\n"), nil
+}
+
+func formatCommand(command string) (string, []string) {
+	formattedCmd := strings.Split(command, " ")
+	return formattedCmd[0], formattedCmd[1:]
+}
+
+func extractNmstatectl(extractDir string) any {
+	workDir := os.TempDir()
+
+	_, err := execute(fmt.Sprintf("7z x %s", filepath.Join(extractDir, "images/pxeboot/rootfs.img")), workDir)
+	if err != nil {
+		fmt.Println("failed to 7z x rootfs.img: ", err.Error())
+	}
+
+	list, err := execute(fmt.Sprintf("unsquashfs -lc %s", "root.squashfs"), workDir)
+	if err != nil {
+		fmt.Println("failed to unsquashfs root.squashfs: ", err.Error())
+	}
+
+	r, err := regexp.Compile(".*nmstatectl")
+	if err != nil {
+		fmt.Println("failed to compile regexp: ", err.Error())
+	}
+	match := r.FindString(list)
+	if err != nil {
+		fmt.Println("failed to compile regexp: ", err.Error())
+	}
+
+	binaryPath := strings.TrimPrefix(match, "squashfs-root")
+	output, err := execute(fmt.Sprintf("unsquashfs -no-xattrs %s -extract-file %s", "root.squashfs", binaryPath), workDir)
+	if err != nil {
+		fmt.Println("failed to unsquashfs root.squashfs: ", err.Error())
+	}
+	fmt.Println(output)
+	return output
+}
+
+//func extractNmstatectl(extractDir string) any {
+//extractFilePath := "root.squashfs"
+//outputFilePath := "/tmp/root.squashfs"
+
+//fileCmd := exec.Command("bash", "-c", fmt.Sprintf("7z x %s", filepath.Join(extractDir, "images/pxeboot/rootfs.img")))
+//output, err := fileCmd.CombinedOutput()
+//if err != nil {
+//	fmt.Println(fmt.Sprint("Failed to run 7z x root.img: ", err) + ": " + string(output))
+//}
+// extract rootfs.img
+//cpioFile, err := os.Open(filepath.Join(extractDir, "images/pxeboot/rootfs.img"))
+//if err != nil {
+//	fmt.Println(err)
+//}
+//
+//defer cpioFile.Close()
+//
+// Create output file
+//outputFile, err := os.Create(outputFilePath)
+//if err != nil {
+//	fmt.Println(err)
+//}
+//defer outputFile.Close()
+
+//// extract the archive
+//reader := cpio.NewReader(cpioFile)
+//for {
+//	hdr, err := reader.Next()
+//	if err == io.EOF {
+//		break
+//	}
+//	if err != nil {
+//		fmt.Println(err)
+//	}
+//
+//	// Check if the current file matches the root.squashfs
+//	if hdr.Name == extractFilePath {
+//		if _, err := io.Copy(outputFile, reader); err != nil {
+//			fmt.Printf("failed to copy root.squashfs content to /tmp/root.squashfs. %v\n", err)
+//		}
+//		fmt.Printf("Extracted %s from CPIO archive\n", extractFilePath)
+//		break
+//	}
+//}
+
+// find the path of nmstatectl in root.squashfs
+//grepCmd := exec.Command("bash", "-c", fmt.Sprintf("unsquashfs -l %s/root.squashfs | grep nmstatectl", filepath.Join(extractDir, "images/pxeboot")))
+//output, err = grepCmd.CombinedOutput()
+//if err != nil {
+//	fmt.Println(fmt.Sprint("Failed to run unsquashfs -l root.squashfs: ", err) + ": " + string(output))
+//}
+//nmstatectlPath := string(output)
+//
+//// Extract the nmstatectl binary
+//if nmstatectlPath != "" {
+//	extractCmd := exec.Command("unsquashfs", "root.squashfs", "-extract-file", nmstatectlPath)
+//	output, err = extractCmd.CombinedOutput()
+//	if err != nil {
+//		log.Fatalf("Failed to extract nmstatectl binary: %v", string(output))
+//	}
+//	fmt.Println("nmstatectl binary extracted successfully.")
+//} else {
+//	fmt.Println("nmstatectl binary not found in squashfs.")
+//}
+//return output
+
+//}
+//
+
 // CreateMinimalISOTemplate Creates the template minimal iso by removing the rootfs and adding the url
 func (e *rhcosEditor) CreateMinimalISOTemplate(fullISOPath, rootFSURL, arch, minimalISOPath string) error {
 	extractDir, err := os.MkdirTemp(e.workDir, "isoutil")
@@ -86,6 +212,8 @@ func (e *rhcosEditor) CreateMinimalISOTemplate(fullISOPath, rootFSURL, arch, min
 
 	ramDiskPath := filepath.Join(extractDir, nmstateDiskImagePath)
 
+	nmstatectl := extractNmstatectl(extractDir)
+	fmt.Printf("nmstatectl = %+v\n", nmstatectl)
 	// Ensure that the runtime CPU arch equals to the requested arch
 	if normalizeCPUArchitecture(runtime.GOARCH) == arch {
 		err = createNmstateRamDisk(arch, e.nmstatectlPath, ramDiskPath)
