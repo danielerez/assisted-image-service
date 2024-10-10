@@ -111,7 +111,7 @@ func main() {
 	}
 
 	is, err := imagestore.NewImageStore(
-		isoeditor.NewEditor(Options.DataDir, isoeditor.NmstatectlPathInRamdisk),
+		isoeditor.NewEditor(Options.DataDir, isoeditor.NewNmstateHandler()),
 		Options.DataDir,
 		Options.ImageServiceBaseURL,
 		Options.InsecureSkipVerify,
